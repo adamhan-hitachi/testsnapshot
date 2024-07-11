@@ -239,8 +239,19 @@ int main(int, char**){
     }
 
     const uint64_t snap_id = snap_info.id;
-    Inode* test_dir_inode_snap = nullptr;
     const vinodeno vivo = {dir_sb.stx_ino, snap_id};
+
+    Inode* test_dir_inode_snap = nullptr;
+    result = ceph_ll_lookup_vino(mount.get(), vivo, &test_dir_inode_snap);
+    if (result) {
+        std::cerr << "Failed to lookup inode of directory {" << std::to_string(vivo.ino.val) << ", " << std::to_string(vivo.snapid.val) << "} in snapshot: error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+        return result;
+    }
+
+    std::shared_ptr<Inode> scoped_test_dir_inode_snap(test_dir_inode_snap, [mount](Inode* inode) {
+        ceph_ll_put(mount.get(), inode);
+    });
+
 
 #if 0
     const std::string dir_snap_path = snap_path + "/" + dir_name;
@@ -291,16 +302,6 @@ int main(int, char**){
         ceph_ll_put(mount.get(), inode);
     });
 #endif 
-
-    result = ceph_ll_lookup_vino(mount.get(), vivo, &test_dir_inode_snap);
-    if (result) {
-        std::cerr << "Failed to lookup inode of directory {" << std::to_string(vivo.ino.val) << ", " << std::to_string(vivo.snapid.val) << "} in snapshot: error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
-        return result;
-    }
-
-    std::shared_ptr<Inode> scoped_test_dir_inode_snap(test_dir_inode_snap, [mount](Inode* inode) {
-        ceph_ll_put(mount.get(), inode);
-    });
 
     struct ceph_statx dir_sb_snap;
     result = ceph_ll_getattr(mount.get(), test_dir_inode_snap, &dir_sb_snap, CEPH_STATX_INO, 0, user_perms.get());
