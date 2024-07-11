@@ -13,6 +13,7 @@ const std::string volume{"cephfs"};
 const std::string sub_volume{"1"};
 const std::string sub_volume_path{"volumes/_nogroup/1/"};
 const std::string fs_path = sub_volume_path + "5763592a-833b-4250-9c31-5e6e23b5564e";
+const std::string snap_dir = fs_path + "/.snap";
 
 const std::string dir_name{"test-snapshot-dir"};
 const std::string xattr_name{"user.test-snapshot-xattr"};
@@ -184,15 +185,25 @@ int main(int, char**){
         return result;
     }
 
+  #if 1
     std::string create_snap_cmd = "ceph fs subvolume snapshot create " + volume + " " + sub_volume + " " + snap_name;
-   
     std::cout << create_snap_cmd << std::endl;
-
     result = system(create_snap_cmd.c_str());
     if (result) {
         std::cerr << "Failed to create snapshot " << snap_name << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
         return result;
     }
+
+  
+  #else 
+    result = ceph_mksnap(mount.get(), fs_path.c_str(), snap_name.c_str(), 0755, nullptr, 0);
+    if (result) {
+        std::cerr << "Failed to create snapshot " << snap_name << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+        return result;
+    }
+
+    std::string snap_path = snap_dir + "/" + snap_name;
+  #endif 
 
     // Example: _test-snapshot-snap_1099511690785    
     struct ceph_statx sub_volume_sb;
@@ -209,7 +220,8 @@ int main(int, char**){
         ceph_ll_put(mount.get(), inode);
     });
 
-    std::string snap_path = fs_path + "/.snap/_" + snap_name + "_" + std::to_string(sub_volume_sb.stx_ino);
+    const std::string snap_dir_name = "_" + snap_name + "_" + std::to_string(sub_volume_sb.stx_ino);
+    std::string snap_path = snap_dir + "/" + snap_dir_name;
     struct ceph_statx snap_sb;
 
     result = ceph_statx(mount.get(), snap_path.c_str(), &snap_sb, CEPH_STATX_ALL_STATS, 0);
@@ -218,9 +230,67 @@ int main(int, char**){
         return result;
     }
 
-    const uint64_t snap_id = snap_sb.stx_dev;
+    snap_info snap_info;
+
+    result = ceph_get_snap_info(mount.get(), snap_path.c_str(), &snap_info);
+    if (result) {
+        std::cerr << "Failed to get snap info of snapshot path " << snap_path << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+        return result;
+    }
+
+    const uint64_t snap_id = snap_info.id;
     Inode* test_dir_inode_snap = nullptr;
     const vinodeno vivo = {dir_sb.stx_ino, snap_id};
+
+#if 0
+    const std::string dir_snap_path = snap_path + "/" + dir_name;
+    struct ceph_statx dir_sb_snap;
+
+    result = ceph_statx(mount.get(), dir_snap_path.c_str(), &dir_sb_snap, CEPH_STATX_ALL_STATS, 0);
+    if (result) {
+        std::cerr << "Failed to statx directory in snapshot " << dir_snap_path << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+        return result;
+    }
+#else 
+    struct ceph_statx sb_snap_dir;
+    result = ceph_statx(mount.get(), snap_dir.c_str(), &sb_snap_dir, CEPH_STATX_ALL_STATS, 0);
+    if (result) {
+        std::cerr << "Failed to statx snapshot dir " << snap_dir << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+        return result;
+    }
+
+    Inode* inode_snap_dir = nullptr;
+    result = ceph_ll_lookup_vino(mount.get(), {sb_snap_dir.stx_ino, sb_snap_dir.stx_dev}, &inode_snap_dir);
+    if (result) {
+        std::cerr << "Failed to lookup inode of .snap directory error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+        return result;
+    }
+    
+    Inode* inode_snap_path = nullptr;
+    struct ceph_statx sb_snap_path;
+    result = ceph_ll_lookup(mount.get(), inode_snap_dir, snap_dir_name.c_str(), &inode_snap_path, &sb_snap_path, CEPH_STATX_INO, 0, user_perms.get());
+    if (result) {
+        std::cerr << "Failed to lookup inode of snapshot path " << snap_dir_name << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+        return result;
+    }
+
+    std::shared_ptr<Inode> scoped_inode_snap_path(inode_snap_path, [mount](Inode* inode) {
+        ceph_ll_put(mount.get(), inode);
+    });
+
+    Inode* inode_snap_sub_dir = nullptr;
+    struct ceph_statx sb_snap_sub_dir;
+
+    result = ceph_ll_lookup(mount.get(), inode_snap_path, dir_name.c_str(), &inode_snap_sub_dir, &sb_snap_sub_dir, CEPH_STATX_INO, 0, user_perms.get());
+    if (result) {
+        std::cerr << "Failed to lookup inode of snapshot sub directory " << dir_name << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+        return result;
+    }
+
+    std::shared_ptr<Inode> scoped_inode_snap_sub_dir(inode_snap_sub_dir, [mount](Inode* inode) {
+        ceph_ll_put(mount.get(), inode);
+    });
+#endif 
 
     result = ceph_ll_lookup_vino(mount.get(), vivo, &test_dir_inode_snap);
     if (result) {
@@ -231,6 +301,15 @@ int main(int, char**){
     std::shared_ptr<Inode> scoped_test_dir_inode_snap(test_dir_inode_snap, [mount](Inode* inode) {
         ceph_ll_put(mount.get(), inode);
     });
+
+    struct ceph_statx dir_sb_snap;
+    result = ceph_ll_getattr(mount.get(), test_dir_inode_snap, &dir_sb_snap, CEPH_STATX_INO, 0, user_perms.get());
+    if (result < 0) {
+        std::cerr << "Failed to stat snapshot file" << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+        return result;
+    }
+
+    std::cout << "snapshot inode " << dir_sb_snap.stx_dev << " >=< " << dir_sb.stx_dev << std::endl;
 
     //const char* new_xattr_name = "ceph.snap.btime";
     const char* new_xattr_name = xattr_name.c_str();
