@@ -178,6 +178,12 @@ int main(int, char**){
         return result;
     }
 
+    result = ceph_ll_getxattr(mount.get(), test_dir_inode, xattr_name.c_str(), nullptr, 0, user_perms.get());
+    if (result < 0) {
+        std::cerr << "Failed to get length of active dir's xattr " << xattr_name << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+        return result;
+    }
+
     std::string create_snap_cmd = "ceph fs subvolume snapshot create " + volume + " " + sub_volume + " " + snap_name;
    
     std::cout << create_snap_cmd << std::endl;
@@ -226,18 +232,19 @@ int main(int, char**){
         ceph_ll_put(mount.get(), inode);
     });
 
-    const std::string new_xattr_name = xattr_name;
+    //const char* new_xattr_name = "ceph.snap.btime";
+    const char* new_xattr_name = xattr_name.c_str();
 
-    result = ceph_ll_getxattr(mount.get(), test_dir_inode_snap, new_xattr_name.c_str(), nullptr, 0, user_perms.get());
-    if (result) {
+    result = ceph_ll_getxattr(mount.get(), test_dir_inode_snap, new_xattr_name, nullptr, 0, user_perms.get());
+    if (result < 0) {
         std::cerr << "Failed to get length of snapshot file's xattr " << new_xattr_name << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
         return result;
     }
 
     std::string xattr_read(result + 1, '\0');
 
-    result = ceph_ll_getxattr(mount.get(), test_dir_inode_snap, new_xattr_name.c_str(), xattr_read.data(), result, user_perms.get());
-    if (result) {
+    result = ceph_ll_getxattr(mount.get(), test_dir_inode_snap, new_xattr_name, xattr_read.data(), result, user_perms.get());
+    if (result < 0) {
         std::cerr << "Failed to get snapshot file's xattr " << new_xattr_name << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
         return result;
     }
