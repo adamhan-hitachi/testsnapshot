@@ -155,6 +155,10 @@ int main(int, char**){
         return result;
     }
 
+    std::shared_ptr<Inode> scoped_parent_inode(parent_inode, [mount](Inode* inode) {
+        ceph_ll_put(mount.get(), inode);
+    });
+
     struct ceph_statx dir_sb;
     Inode* test_dir_inode = nullptr;
 
@@ -163,6 +167,10 @@ int main(int, char**){
         std::cerr << "Failed to create directory " << dir_name << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
         return result;
     }
+
+    std::shared_ptr<Inode> scoped_test_dir_inode(test_dir_inode, [mount](Inode* inode) {
+        ceph_ll_put(mount.get(), inode);
+    });
 
     result = ceph_ll_setxattr(mount.get(), test_dir_inode, xattr_name.c_str(), xattr_value.c_str(), xattr_value.size(), 0, user_perms.get());
     if (result) {
@@ -190,6 +198,11 @@ int main(int, char**){
         std::cerr << "Failed to walk ceph path " << sub_volume_path << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
         return result;
     }
+
+    std::shared_ptr<Inode> scoped_sub_volume_inode(sub_volume_inode, [mount](Inode* inode) {
+        ceph_ll_put(mount.get(), inode);
+    });
+
     std::string snap_path = fs_path + "/.snap/_" + snap_name + "_" + std::to_string(sub_volume_sb.stx_ino);
     struct ceph_statx snap_sb;
 
@@ -208,6 +221,10 @@ int main(int, char**){
         std::cerr << "Failed to lookup inode of directory {" << std::to_string(vivo.ino.val) << ", " << std::to_string(vivo.snapid.val) << "} in snapshot: error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
         return result;
     }
+
+    std::shared_ptr<Inode> scoped_test_dir_inode_snap(test_dir_inode_snap, [mount](Inode* inode) {
+        ceph_ll_put(mount.get(), inode);
+    });
 
     const std::string new_xattr_name = xattr_name;
 
