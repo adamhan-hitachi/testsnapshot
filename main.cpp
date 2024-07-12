@@ -8,6 +8,9 @@
 #include <iostream>
 #include <memory>
 #include <cstdlib>
+#include <functional>
+#include <dirent.h>
+#include <queue>
 
 const std::string volume{"cephfs"};
 const std::string sub_volume{"1"};
@@ -124,6 +127,54 @@ int Mount(std::shared_ptr<ceph_mount_info>& mount, std::shared_ptr<UserPerm>& us
   return result;
 }
 
+using DirEntryCallback =
+      std::function<bool(const std::string& name, const struct ceph_statx& sb, std::shared_ptr<Inode>)>;
+
+int ReadDir(std::shared_ptr<ceph_mount_info> mount, std::shared_ptr<Inode> parent, DirEntryCallback callback) {
+
+  struct ceph_dir_result* dh_parent = nullptr;
+
+  int result = ceph_ll_opendir(mount.get(), parent.get(), &dh_parent, ceph_mount_perms(mount.get()));
+  if (result) {
+      std::cerr << "Failed to open directory: error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+      return result;
+  }
+
+  std::shared_ptr<ceph_dir_result> scoped_dh_parent(dh_parent, [mount](ceph_dir_result* dh) {
+      ceph_ll_releasedir(mount.get(), dh);
+  });
+
+  bool done = false;
+
+  do {
+    dirent entry;
+    struct ceph_statx sb;
+    struct Inode* ceph_inode;
+
+    result = ceph_readdirplus_r(mount.get(), dh_parent, &entry, &sb,
+                                         CEPH_STATX_ALL_STATS, 0, &ceph_inode);
+    if (result < 0) {
+      std::cerr << "Failed to read directory: error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+      break;
+    }
+
+    if (result == 0) {
+      break;
+    }
+
+    auto eh = std::shared_ptr<Inode>(ceph_inode, [mount](struct Inode* inode) {
+            ceph_ll_put(mount.get(), inode);
+          });
+
+    const std::string entry_name(entry.d_name);
+
+    done = not callback(entry_name, sb, eh);
+  } while (not done);
+
+  return result;
+}
+
+
 typedef struct inodeno_t {
   uint64_t val;
 } inodeno_t;
@@ -147,23 +198,23 @@ int main(int, char**){
         return result;
     }
 
-    struct ceph_statx parent_sb;
-    Inode* parent_inode = nullptr;
+    struct ceph_statx sb_fs;
+    Inode* inode_fs = nullptr;
 
-    result = ceph_ll_walk(mount.get(), fs_path.c_str(), &parent_inode, &parent_sb, CEPH_STATX_ALL_STATS, 0, user_perms.get());
+    result = ceph_ll_walk(mount.get(), fs_path.c_str(), &inode_fs, &sb_fs, CEPH_STATX_ALL_STATS, 0, user_perms.get());
     if (result) {
         std::cerr << "Failed to walk ceph path " << fs_path << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
         return result;
     }
 
-    std::shared_ptr<Inode> scoped_parent_inode(parent_inode, [mount](Inode* inode) {
+    std::shared_ptr<Inode> scoped_parent_inode(inode_fs, [mount](Inode* inode) {
         ceph_ll_put(mount.get(), inode);
     });
 
     struct ceph_statx dir_sb;
     Inode* test_dir_inode = nullptr;
 
-    result = ceph_ll_mkdir(mount.get(), parent_inode, dir_name.c_str(), 0755, &test_dir_inode, &dir_sb, CEPH_STATX_ALL_STATS, 0, user_perms.get());
+    result = ceph_ll_mkdir(mount.get(), inode_fs, dir_name.c_str(), 0755, &test_dir_inode, &dir_sb, CEPH_STATX_ALL_STATS, 0, user_perms.get());
     if (result) {
         std::cerr << "Failed to create directory " << dir_name << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
         return result;
@@ -253,6 +304,13 @@ int main(int, char**){
     });
 
 
+    struct ceph_statx dir_sb_snap_try;
+    result = ceph_ll_getattr(mount.get(), test_dir_inode_snap, &dir_sb_snap_try, CEPH_STATX_ALL_STATS, 0, user_perms.get());
+    if (result < 0) {
+        std::cerr << "Failed to stat snapshot file" << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+        return result;
+    }
+
 #if 0
     const std::string dir_snap_path = snap_path + "/" + dir_name;
     struct ceph_statx dir_sb_snap;
@@ -262,7 +320,7 @@ int main(int, char**){
         std::cerr << "Failed to statx directory in snapshot " << dir_snap_path << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
         return result;
     }
-#else 
+#elif 0
     struct ceph_statx sb_snap_dir;
     result = ceph_statx(mount.get(), snap_dir.c_str(), &sb_snap_dir, CEPH_STATX_ALL_STATS, 0);
     if (result) {
@@ -301,16 +359,184 @@ int main(int, char**){
     std::shared_ptr<Inode> scoped_inode_snap_sub_dir(inode_snap_sub_dir, [mount](Inode* inode) {
         ceph_ll_put(mount.get(), inode);
     });
+#else
+  Inode* inode_snap_dir = nullptr;
+  struct ceph_statx sb_snap_dir;
+
+  result = ceph_ll_lookup(mount.get(), inode_fs, ".snap", &inode_snap_dir, &sb_snap_dir, CEPH_STATX_INO, 0, user_perms.get());
+  if (result) {
+      std::cerr << "Failed to lookup inode of .snap directory: error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+      return result;
+  }
+
+  auto scoped_inode_snap_dir = std::shared_ptr<Inode>(inode_snap_dir, [mount](Inode* inode) {
+      ceph_ll_put(mount.get(), inode);
+  });
+    
+  std::shared_ptr<Inode> scoped_inode_parent;
+
+  auto ecb = [snap_id, &scoped_inode_parent](const std::string& name, const struct ceph_statx& sb, std::shared_ptr<Inode> inode){
+    if (sb.stx_dev == snap_id) {
+      scoped_inode_parent = inode;
+      return false;
+    }
+    return true;
+  };
+
+  result = ReadDir(mount, scoped_inode_snap_dir, ecb);
+  if (not scoped_inode_parent) {
+    std::cerr << "Failed to find snapshot inode" << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+    return result;
+  }
+
+  std::shared_ptr<Inode> scoped_inode_my;
+  std::deque<std::shared_ptr<Inode>> inode_queue;
+
+  while (true) {  
+    bool done = false;
+
+    auto ecb = [&dir_sb, &scoped_inode_my, &inode_queue](const std::string& name, const struct ceph_statx& sb, std::shared_ptr<Inode> inode){
+      bool next = true;
+
+      if (sb.stx_ino == dir_sb.stx_ino) {
+        scoped_inode_my = inode;
+        next = false;
+      } else if (S_ISDIR(sb.stx_mode) and sb.stx_nlink > 0) {
+        inode_queue.push_back(inode);
+      } 
+      
+      return next;
+    };
+
+    result = ReadDir(mount, scoped_inode_parent, ecb);
+
+    if (scoped_inode_my) {
+      break;
+    }
+
+    if (inode_queue.empty()) {
+      break;
+    }
+
+    scoped_inode_parent = inode_queue.front();
+    inode_queue.pop_front(); 
+  }
+
+  if (not scoped_inode_my) {
+    std::cerr << "Not found snapshot inode" << std::endl;
+    return -EINVAL;
+  }
+
+  if (scoped_inode_my.get() != test_dir_inode_snap) {
+    std::cerr << "Mismatched snapshot file handles" << std::endl;
+    return -EINVAL;
+  }
+    
 #endif 
 
     struct ceph_statx dir_sb_snap;
-    result = ceph_ll_getattr(mount.get(), test_dir_inode_snap, &dir_sb_snap, CEPH_STATX_INO, 0, user_perms.get());
+    result = ceph_ll_getattr(mount.get(), test_dir_inode_snap, &dir_sb_snap, CEPH_STATX_ALL_STATS, 0, user_perms.get());
     if (result < 0) {
         std::cerr << "Failed to stat snapshot file" << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
         return result;
     }
 
     std::cout << "snapshot inode " << dir_sb_snap.stx_dev << " >=< " << dir_sb.stx_dev << std::endl;
+
+    if (dir_sb_snap.stx_dev != dir_sb_snap_try.stx_dev) {
+        std::cerr << "Snapshot inode device mismatch: " << dir_sb_snap.stx_dev << " != " << dir_sb_snap_try.stx_dev << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_ino != dir_sb_snap_try.stx_ino) {
+        std::cerr << "Snapshot inode number mismatch: " << dir_sb_snap.stx_ino << " != " << dir_sb_snap_try.stx_ino << std::endl;
+        return -EINVAL;
+    }
+    
+    if (dir_sb_snap.stx_size != dir_sb_snap_try.stx_size) {
+        std::cerr << "Snapshot inode size mismatch: " << dir_sb_snap.stx_size << " != " << dir_sb_snap_try.stx_size << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_blocks != dir_sb_snap_try.stx_blocks) {
+        std::cerr << "Snapshot inode blocks mismatch: " << dir_sb_snap.stx_blocks << " != " << dir_sb_snap_try.stx_blocks << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_mode != dir_sb_snap_try.stx_mode) {
+        std::cerr << "Snapshot inode mode mismatch: " << dir_sb_snap.stx_mode << " != " << dir_sb_snap_try.stx_mode << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_uid != dir_sb_snap_try.stx_uid) {
+        std::cerr << "Snapshot inode uid mismatch: " << dir_sb_snap.stx_uid << " != " << dir_sb_snap_try.stx_uid << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_gid != dir_sb_snap_try.stx_gid) {
+        std::cerr << "Snapshot inode gid mismatch: " << dir_sb_snap.stx_gid << " != " << dir_sb_snap_try.stx_gid << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_nlink != dir_sb_snap_try.stx_nlink) {
+        std::cerr << "Snapshot inode nlink mismatch: " << dir_sb_snap.stx_nlink << " != " << dir_sb_snap_try.stx_nlink << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_rdev != dir_sb_snap_try.stx_rdev) {
+        std::cerr << "Snapshot inode rdev mismatch: " << dir_sb_snap.stx_rdev << " != " << dir_sb_snap_try.stx_rdev << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_blksize != dir_sb_snap_try.stx_blksize) {
+        std::cerr << "Snapshot inode blksize mismatch: " << dir_sb_snap.stx_blksize << " != " << dir_sb_snap_try.stx_blksize << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_version != dir_sb_snap_try.stx_version) {
+        std::cerr << "Snapshot inode version mismatch: " << dir_sb_snap.stx_version << " != " << dir_sb_snap_try.stx_version << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_atime.tv_sec != dir_sb_snap_try.stx_atime.tv_sec) {
+        std::cerr << "Snapshot inode atime sec mismatch: " << dir_sb_snap.stx_atime.tv_sec << " != " << dir_sb_snap_try.stx_atime.tv_sec << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_atime.tv_nsec != dir_sb_snap_try.stx_atime.tv_nsec) {
+        std::cerr << "Snapshot inode atime nsec mismatch: " << dir_sb_snap.stx_atime.tv_nsec << " != " << dir_sb_snap_try.stx_atime.tv_nsec << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_ctime.tv_sec != dir_sb_snap_try.stx_ctime.tv_sec) {
+        std::cerr << "Snapshot inode ctime sec mismatch: " << dir_sb_snap.stx_ctime.tv_sec << " != " << dir_sb_snap_try.stx_ctime.tv_sec << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_ctime.tv_nsec != dir_sb_snap_try.stx_ctime.tv_nsec) {
+        std::cerr << "Snapshot inode ctime nsec mismatch: " << dir_sb_snap.stx_ctime.tv_nsec << " != " << dir_sb_snap_try.stx_ctime.tv_nsec << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_mtime.tv_sec != dir_sb_snap_try.stx_mtime.tv_sec) {
+        std::cerr << "Snapshot inode mtime sec mismatch: " << dir_sb_snap.stx_mtime.tv_sec << " != " << dir_sb_snap_try.stx_mtime.tv_sec << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_mtime.tv_nsec != dir_sb_snap_try.stx_mtime.tv_nsec) {
+        std::cerr << "Snapshot inode mtime nsec mismatch: " << dir_sb_snap.stx_mtime.tv_nsec << " != " << dir_sb_snap_try.stx_mtime.tv_nsec << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_btime.tv_sec != dir_sb_snap_try.stx_btime.tv_sec) {
+        std::cerr << "Snapshot inode btime sec mismatch: " << dir_sb_snap.stx_btime.tv_sec << " != " << dir_sb_snap_try.stx_btime.tv_sec << std::endl;
+        return -EINVAL;
+    }
+
+    if (dir_sb_snap.stx_btime.tv_nsec != dir_sb_snap_try.stx_btime.tv_nsec) {
+        std::cerr << "Snapshot inode btime nsec mismatch: " << dir_sb_snap.stx_btime.tv_nsec << " != " << dir_sb_snap_try.stx_btime.tv_nsec << std::endl;
+        return -EINVAL;
+    }
 
     //const char* new_xattr_name = "ceph.snap.btime";
     const char* new_xattr_name = xattr_name.c_str();
