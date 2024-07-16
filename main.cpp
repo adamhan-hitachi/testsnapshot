@@ -284,11 +284,11 @@ int prepare(std::shared_ptr<ceph_mount_info> mount, struct ceph_statx& dir_sb, s
     return result;
   }
 
-  // result = ceph_ll_unlink(mount.get(), inode_fs, file_name.c_str(), ceph_mount_perms(mount.get()));
-  // if (result) {
-  //   std::cerr << "Failed to unlink file" ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
-  //   return result;
-  // }
+  result = ceph_ll_unlink(mount.get(), inode_fs, file_name.c_str(), ceph_mount_perms(mount.get()));
+  if (result) {
+    std::cerr << "Failed to unlink file" ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+    return result;
+  }
 
   return result;
 }
@@ -448,25 +448,37 @@ int main(int, char**){
     });
   }
 #elif 1
-  struct ceph_statx sb;
+  // Access file ../.snap/snapshot/file
 
-  // Access file
-  const vinodeno vivo_live_file = {file_sb.stx_ino, file_sb.stx_dev};
-  Inode* inode_live_file = nullptr;
-  result = ceph_ll_lookup_vino(mount.get(), vivo_live_file, &inode_live_file);
-  if (result) {
-      std::cerr << "Failed to lookup inode of the live file " << -result << " (" << ::strerror(-result) << ")" << std::endl;
-      return result;
+  {
+    struct ceph_statx sb;
+    
+    result = ceph_ll_getattr(mount.get(), test_file_inode_snap, &sb, CEPH_STATX_MODE, 0, user_perms.get());
+    if (result < 0) {
+        std::cerr << "Failed to stat file in snapshot" << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+    }
+
+    if (S_ISDIR(sb.stx_mode)) {
+        std::cerr << "Failed to read type of deleted file" << std::endl;
+    }
   }
 
-  std::shared_ptr<Inode> scoped_inode_live_file(inode_live_file, [mount](Inode* inode) {
+  Inode* inode_snap_parent = nullptr;
+  struct ceph_statx sb;
+  result = ceph_ll_lookup(mount.get(), test_file_inode_snap, "..", &inode_snap_parent, &sb, CEPH_STATX_INO, 0, user_perms.get());
+  if (result) {
+    std::cerr << "Failed to get parent of live file" << -result << " (" << ::strerror(-result) << ")" << std::endl;
+    return result;
+  }
+
+  std::shared_ptr<Inode> scoped_inode_snap_parent(inode_snap_parent, [mount](Inode* inode) {
     ceph_ll_put(mount.get(), inode);
   });
 
   Inode* inode_live_parent = nullptr;
-  result = ceph_ll_lookup(mount.get(), inode_live_file, "..", &inode_live_parent, &sb, CEPH_STATX_INO, 0, user_perms.get());
+  result = ceph_ll_lookup_vino(mount.get(), {sb.stx_ino, file_sb.stx_dev}, &inode_live_parent);
   if (result) {
-    std::cerr << "Failed to get parent of live file" << -result << " (" << ::strerror(-result) << ")" << std::endl;
+    std::cerr << "Failed to get parent of live file " << sb.stx_ino << -result << " (" << ::strerror(-result) << ")" << std::endl;
     return result;
   }
 
@@ -478,7 +490,7 @@ int main(int, char**){
 
   result = ceph_ll_lookup(mount.get(), inode_live_parent, ".snap", &inode_snap_the_parent, &sb, CEPH_STATX_INO, 0, user_perms.get());
   if (result) {
-    std::cerr << "Filed to lookup .snap in live parent of file" << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+    std::cerr << "Filed to lookup .snap in live parent of file" << sb.stx_ino << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
     return result;
   }
 
@@ -503,10 +515,10 @@ int main(int, char**){
   }
 
   bool found = false;
-  auto ecb_file = [&vivo_live_file, &found](const std::string& name, const struct ceph_statx& sb, std::shared_ptr<Inode> inode){
+  auto ecb_file = [&vivo_file, &found](const std::string& name, const struct ceph_statx& sb, std::shared_ptr<Inode> inode){
     std::cout << "searching snapshot " << name << std::endl;
 
-    if (sb.stx_ino == vivo_live_file.ino.val) {
+    if (sb.stx_ino == vivo_file.ino.val) {
       found = true;
       return false;
     }
@@ -532,6 +544,19 @@ int main(int, char**){
   std::shared_ptr<Inode> scoped_inode_live_dir(inode_live_dir, [mount](Inode* inode) {
     ceph_ll_put(mount.get(), inode);
   });
+
+  {
+    struct ceph_statx sb;
+    
+    result = ceph_ll_getattr(mount.get(), inode_live_dir, &sb, CEPH_STATX_MODE, 0, user_perms.get());
+    if (result < 0) {
+        std::cerr << "Failed to stat deleted directory" << ": error " << -result << " (" << ::strerror(-result) << ")" << std::endl;
+    }
+
+    if (not S_ISDIR(sb.stx_mode)) {
+        std::cerr << "Failed to read type of deleted directory" << std::endl;
+    }
+  }
 
   Inode *inode_snap_the_dir = nullptr;
 
