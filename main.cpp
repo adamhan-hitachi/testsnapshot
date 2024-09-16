@@ -16,10 +16,11 @@ const std::string volume{"cephfs"};
 const std::string sub_volume{"1"};
 const std::string sub_volume_path{"volumes/_nogroup/1/"};
 const std::string fs_path =
-    sub_volume_path + "5763592a-833b-4250-9c31-5e6e23b5564e";
+    sub_volume_path + "7fdca653-41a3-4c47-bf85-1848d3f104d2";
 const std::string snap_dir = fs_path + "/.snap";
 
 const std::string dir_name{"test-snapshot-dir"};
+const std::string sub_dir_name{"test-snapshot-sub-dir"};
 const std::string file_name{"test-snapshot-file"};
 const std::string xattr_name{"user.test-snapshot-xattr"};
 const std::string xattr_value{"test-snapshot-xattr-value"};
@@ -204,8 +205,8 @@ typedef struct vinodeno_t {
   snapid_t snapid;
 } vinodeno_t;
 
-int prepare(std::shared_ptr<ceph_mount_info> mount, struct ceph_statx& dir_sb,
-            struct ceph_statx& file_sb) {
+int prepare(std::shared_ptr<ceph_mount_info> mount, struct ceph_statx& dir_sb, 
+            struct ceph_statx& sub_dir_sb, struct ceph_statx& file_sb) {
   struct ceph_statx sb_fs;
   Inode* inode_fs = nullptr;
 
@@ -249,6 +250,39 @@ int prepare(std::shared_ptr<ceph_mount_info> mount, struct ceph_statx& dir_sb,
                             nullptr, 0, ceph_mount_perms(mount.get()));
   if (result < 0) {
     std::cerr << "Failed to get length of active dir's xattr " << xattr_name
+              << ": error " << -result << " (" << ::strerror(-result) << ")"
+              << std::endl;
+    return result;
+  }
+
+  Inode* test_sub_dir_inode = nullptr;
+
+  result = ceph_ll_mkdir(mount.get(), test_dir_inode, sub_dir_name.c_str(), 0755,
+                         &test_sub_dir_inode, &sub_dir_sb, CEPH_STATX_ALL_STATS, 0,
+                         ceph_mount_perms(mount.get()));
+  if (result) {
+    std::cerr << "Failed to create sub directory " << sub_dir_name << ": error "
+              << -result << " (" << ::strerror(-result) << ")" << std::endl;
+    return result;
+  }
+
+  std::shared_ptr<Inode> scoped_test_sub_dir_inode(
+      test_sub_dir_inode,
+      [mount](Inode* inode) { ceph_ll_put(mount.get(), inode); });
+
+  result = ceph_ll_setxattr(mount.get(), test_sub_dir_inode, xattr_name.c_str(),
+                            xattr_value.c_str(), xattr_value.size(), 0,
+                            ceph_mount_perms(mount.get()));
+  if (result) {
+    std::cerr << "Failed to set sub-dir's xattr " << xattr_name << ": error " << -result
+              << " (" << ::strerror(-result) << ")" << std::endl;
+    return result;
+  }
+
+  result = ceph_ll_getxattr(mount.get(), test_sub_dir_inode, xattr_name.c_str(),
+                            nullptr, 0, ceph_mount_perms(mount.get()));
+  if (result < 0) {
+    std::cerr << "Failed to get length of active sub-dir's xattr " << xattr_name
               << ": error " << -result << " (" << ::strerror(-result) << ")"
               << std::endl;
     return result;
@@ -327,6 +361,15 @@ int prepare(std::shared_ptr<ceph_mount_info> mount, struct ceph_statx& dir_sb,
 
 #endif
 
+  result = ceph_ll_rmdir(mount.get(), test_dir_inode, sub_dir_name.c_str(),
+                         ceph_mount_perms(mount.get()));
+  if (result) {
+    std::cerr << "Failed to rmdir"
+              << ": error " << -result << " (" << ::strerror(-result) << ")"
+              << std::endl;
+    return result;
+  }
+
   result = ceph_ll_rmdir(mount.get(), inode_fs, dir_name.c_str(),
                          ceph_mount_perms(mount.get()));
   if (result) {
@@ -365,9 +408,10 @@ int main(int, char**) {
   }
 
   struct ceph_statx dir_sb;
+  struct ceph_statx sub_dir_sb;
   struct ceph_statx file_sb;
 
-  result = prepare(mount, dir_sb, file_sb);
+  result = prepare(mount, dir_sb, sub_dir_sb, file_sb);
   if (result) {
     return result;
   }
@@ -414,6 +458,7 @@ int main(int, char**) {
 
   const uint64_t snap_id = snap_info.id;
   const vinodeno vivo_dir = {dir_sb.stx_ino, snap_id};
+  const vinodeno vivo_sub_dir = {sub_dir_sb.stx_ino, snap_id};
   const vinodeno vivo_file = {file_sb.stx_ino, snap_id};
 
   Inode* test_dir_inode_snap = nullptr;
@@ -428,6 +473,20 @@ int main(int, char**) {
 
   std::shared_ptr<Inode> scoped_test_dir_inode_snap(
       test_dir_inode_snap,
+      [mount](Inode* inode) { ceph_ll_put(mount.get(), inode); });
+
+  Inode* test_sub_dir_inode_snap = nullptr;
+  result = ceph_ll_lookup_vino(mount.get(), vivo_sub_dir, &test_sub_dir_inode_snap);
+  if (result) {
+    std::cerr << "Failed to lookup inode of sub directory {"
+              << std::to_string(vivo_sub_dir.ino.val) << ", "
+              << std::to_string(vivo_sub_dir.snapid.val) << "} in snapshot: error "
+              << -result << " (" << ::strerror(-result) << ")" << std::endl;
+    return result;
+  }
+
+  std::shared_ptr<Inode> scoped_test_sub_dir_inode_snap(
+      test_sub_dir_inode_snap,
       [mount](Inode* inode) { ceph_ll_put(mount.get(), inode); });
 
   Inode* test_file_inode_snap = nullptr;
@@ -735,6 +794,51 @@ int main(int, char**) {
   }
 
   std::cerr << "xattr of dir in snapshot: " << snap_id << " is: " << xattr_read
+            << std::endl;
+
+  bool found_sub_dir = false;
+  auto sub_dir_ecb = [&sub_dir_sb, &found_sub_dir](
+                  const std::string& name, const struct ceph_statx& sb,
+                  std::shared_ptr<Inode> inode) {
+    bool next = true;
+
+    if (sb.stx_ino == sub_dir_sb.stx_ino) {
+      found_sub_dir = true;
+      next = false;
+    } 
+
+    return next;
+  };
+
+  result = ReadDir(mount, scoped_test_dir_inode_snap, sub_dir_ecb);
+  if (not found_sub_dir) {
+    std::cerr << "Failed to find sub-dir in snapshot"
+              << ": error " << -result << " (" << ::strerror(-result) << ")"
+              << std::endl;
+    return result;
+  }
+
+  result = ceph_ll_getxattr(mount.get(), test_sub_dir_inode_snap, new_xattr_name,
+                            nullptr, 0, user_perms.get());
+  if (result < 0) {
+    std::cerr << "Failed to get length of snapshot sub-dir's xattr "
+              << new_xattr_name << ": error " << -result << " ("
+              << ::strerror(-result) << ")" << std::endl;
+    return result;
+  }
+
+  xattr_read.resize(result + 1, '\0');
+
+  result = ceph_ll_getxattr(mount.get(), test_sub_dir_inode_snap, new_xattr_name,
+                            xattr_read.data(), result, user_perms.get());
+  if (result < 0) {
+    std::cerr << "Failed to get snapshot sub-dir's xattr " << new_xattr_name
+              << ": error " << -result << " (" << ::strerror(-result) << ")"
+              << std::endl;
+    return result;
+  }
+
+  std::cerr << "xattr of sub-dir in snapshot: " << snap_id << " is: " << xattr_read
             << std::endl;
 
   result = ceph_ll_getxattr(mount.get(), test_file_inode_snap, new_xattr_name,
